@@ -11,11 +11,11 @@ end
 function loss(ws, wadd, s, images, captions; dropouts=Dict())
     images = KnetArray(images)
     if wadd == nothing
-        visual = transpose(vgg16(ws[1:end-7], images; dropouts=dropouts))
+        visual = transpose(vgg16(ws[1:end-6], images; dropouts=dropouts))
     else
         visual = transpose(vgg16(wadd, images; dropouts=dropouts))
     end
-    return decoder(ws[end-6:end], s, visual, captions; dropouts=dropouts)
+    return decoder(ws[end-5:end], s, visual, captions; dropouts=dropouts)
 end
 
 # loss gradient
@@ -33,18 +33,16 @@ end
 # w[1] & w[2] => weight and bias params for LSTM network
 # w[3] & w[4] => weight and bias params for softmax layer
 # w[5] & w[6] => weights for visual and textual embeddings
-# w[7]        => multimodal embedding
 # s[1] & s[2] => hidden state and cell state of LSTM net
 function initweights(atype, hidden, visual, vocab, embed, winit)
-    w = Array(Any, 7)
-    input = embed
+    w = Array(Any, 6)
+    input = 2*embed
     w[1] = winit*randn(input+hidden, 4*hidden)
     w[2] = zeros(1, 4*hidden)
     w[3] = winit*randn(hidden, vocab)
     w[4] = zeros(1, vocab)
     w[5] = winit*randn(visual, embed)
     w[6] = winit*randn(vocab, embed)
-    w[7] = winit*randn(2*embed, embed)
     return map(i->convert(atype, i), w)
 end
 
@@ -81,8 +79,6 @@ function decoder(w, s, vis, seq; dropouts=Dict())
         text = text * w[6]
         text = dropout(text, wembdrop)
         x = hcat(dropout(vis, vembdrop), text)
-        x = x * w[7]
-        x = dropout(x, membdrop)
         (s[1], s[2]) = lstm(w[1], w[2], s[1], s[2], x)
         ht = s[1]
         ht = dropout(ht, softdrop)
@@ -124,7 +120,6 @@ function generate(w1, w2, s, image, vocab, maxlen; beamsize=1)
             onehotvec[word2index(vocab, word)] = 1
             text = convert(atype, onehotvec) * w2[6]
             x = hcat(vis, text)
-            x = x * w2[7]
             (st[1], st[2]) = lstm(w2[1], w2[2], st[1], st[2], x)
             ypred = logp(st[1] * w2[3] .+ w2[4], 2)
             ypred = convert(Array{Float32}, ypred)[:]
