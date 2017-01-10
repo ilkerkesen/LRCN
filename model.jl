@@ -8,14 +8,15 @@ function dropout(x,d)
 end
 
 # loss function
-function loss(ws, wadd, s, images, captions; dropouts=Dict())
-    images = KnetArray(images)
-    if wadd == nothing
-        visual = transpose(vgg16(ws[1:end-6], images; dropouts=dropouts))
+function loss(w, s, visual, captions; dropouts=Dict(), finetune=false)
+    if finetune
+        visual = vgg19(w[1:end-6], KnetArray(visual); dropouts=dropouts)
+        visual = transpose(visual)
     else
-        visual = transpose(vgg16(wadd, images; dropouts=dropouts))
+        atype = typeof(AutoGrad.getval(w[1]))
+        visual = convert(atype, visual)
     end
-    return decoder(ws[end-5:end], s, visual, captions; dropouts=dropouts)
+    return decoder(w[end-5:end], s, visual, captions; dropouts=dropouts)
 end
 
 # loss gradient
@@ -69,16 +70,14 @@ function decoder(w, s, vis, seq; dropouts=Dict())
     vembdrop = get(dropouts, "vembdrop", 0.0)
     wembdrop = get(dropouts, "wembdrop", 0.0)
     softdrop = get(dropouts, "softdrop", 0.0)
+    fc7drop  = get(dropouts, "fc7drop", 0.0)
 
-    # visual features
-    vis = vis * w[5]
-
-    # textual features
     text = convert(atype, seq[1])
     for i = 1:length(seq)-1
+        visual = dropout(vis, fc7drop) * w[5]
         text = text * w[6]
         text = dropout(text, wembdrop)
-        x = hcat(dropout(vis, vembdrop), text)
+        x = hcat(dropout(visual, vembdrop), text)
         (s[1], s[2]) = lstm(w[1], w[2], s[1], s[2], x)
         ht = s[1]
         ht = dropout(ht, softdrop)
@@ -92,12 +91,58 @@ function decoder(w, s, vis, seq; dropouts=Dict())
     return -total / count
 end
 
+# one epoch training
+function train!(w, s, data, optparams; lr=0.0, gclip=0.0, dropouts=Dict(), finetune=false)
+    for batch in data
+        gloss = lossgradient(w, copy(s), batch[2:end]...; dropouts=dropouts, finetune=finetune)
+
+        # gradient clipping
+        gscale = lr
+        if gclip > 0
+            gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
+            if gnorm > gclip
+                gscale *= gclip / gnorm
+            end
+        end
+
+        # updateparams
+        for k in 1:length(w)
+            optparams[k].lr = gscale
+            update!(w[k], gloss[k], optparams[k])
+        end
+
+        isa(s,Vector{Any}) || error("State should not be Boxed.")
+        for i = 1:length(s)
+            s[i] = AutoGrad.getval(s[i])
+        end
+        flush(STDOUT)
+    end
+end
+
+# split testing
+function test(w, s, batches; finetune=false)
+    total = 0.0
+    count = 0
+    for batch in batches
+        _, img, cap = batch
+        total += loss(w, copy(s), img, cap; finetune=finetune)
+        count += 1
+        flush(STDOUT)
+    end
+    return total/count
+end
+
 # generate
-function generate(w1, w2, s, image, vocab, maxlen; beamsize=1)
-    atype = typeof(AutoGrad.getval(w2[1]))
-    image = KnetArray(image)
-    vis = vgg16(w1, image)
-    vis = transpose(vis) * w2[5]
+function generate(w, wcnn, s, vis, vocab, maxlen; beamsize=1)
+    atype = typeof(AutoGrad.getval(w[1]))
+    if wcnn != nothing
+        image = KnetArray(image)
+        vis = vgg19(wcnn, image)
+        vis = transpose(vis)
+    else
+        vis = convert(atype, vis)
+    end
+    vis = vis * w[5]
 
     # language generation with (sentence, state, probability) array
     sentences = Any[(Any[SOS],s,0.0)]
@@ -118,10 +163,10 @@ function generate(w1, w2, s, image, vocab, maxlen; beamsize=1)
             # get probabilities
             onehotvec = zeros(Cuchar, 1, vocab.size)
             onehotvec[word2index(vocab, word)] = 1
-            text = convert(atype, onehotvec) * w2[6]
+            text = convert(atype, onehotvec) * w[6]
             x = hcat(vis, text)
-            (st[1], st[2]) = lstm(w2[1], w2[2], st[1], st[2], x)
-            ypred = logp(st[1] * w2[3] .+ w2[4], 2)
+            (st[1], st[2]) = lstm(w[1], w[2], st[1], st[2], x)
+            ypred = logp(st[1] * w[3] .+ w[4], 2)
             ypred = convert(Array{Float32}, ypred)[:]
 
             # add most probable predictions to array
